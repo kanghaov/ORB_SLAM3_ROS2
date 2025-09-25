@@ -1,3 +1,16 @@
 vocabulary/ORBvoc.txt
 config/isaac
 launch
+
+# VS Code
+.vscode/
+!.vscode/c_cpp_properties.json
+!.vscode/settings.json
+
+# Build
+build/
+install/
+log/
+
+# Compile commands
+compile_commands.json
