@@ -1,17 +1,50 @@
 #include "stereo-inertial-node.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
-#include <cstdlib>
+#include <iomanip>
+#include <iostream>
 #include <limits>
 #include <vector>
+
+#include <rmw/qos_profiles.h>
 #include <opencv2/core/core.hpp>
 
 using std::placeholders::_1;
 
-StereoInertialNode::StereoInertialNode(ORB_SLAM3::System *SLAM, const string &strSettingsFile, const string &strDoRectify, const string &strDoEqual) :
-    Node("ORB_SLAM3_ROS2"),
-    SLAM_(SLAM)
+namespace
+{
+inline rclcpp::QoS make_reliable_qos(std::size_t depth)
+{
+    auto qos = rclcpp::QoS(rclcpp::KeepLast(depth));
+    qos.reliability(RMW_QOS_POLICY_RELIABILITY_RELIABLE);
+    qos.durability(RMW_QOS_POLICY_DURABILITY_VOLATILE);
+    return qos;
+}
+
+inline rclcpp::QoS q_img()
+{
+    return make_reliable_qos(30);
+}
+
+inline rclcpp::QoS q_imu()
+{
+    return make_reliable_qos(400);
+}
+
+inline double duration_ms(const rclcpp::Duration &d)
+{
+    return static_cast<double>(d.nanoseconds()) / 1e6;
+}
+} // namespace
+
+StereoInertialNode::StereoInertialNode(ORB_SLAM3::System *SLAM,
+                                       const string &strSettingsFile,
+                                       const string &strDoRectify,
+                                       const string &strDoEqual)
+    : Node("ORB_SLAM3_ROS2"),
+      SLAM_(SLAM)
 {
     stringstream ss_rec(strDoRectify);
     ss_rec >> boolalpha >> doRectify_;
@@ -25,11 +58,10 @@ StereoInertialNode::StereoInertialNode(ORB_SLAM3::System *SLAM, const string &st
 
     if (doRectify_)
     {
-        // Load settings related to stereo calibration
         cv::FileStorage fsSettings(strSettingsFile, cv::FileStorage::READ);
         if (!fsSettings.isOpened())
         {
-            cerr << "ERROR: Wrong path to settings" << endl;
+            std::cerr << "ERROR: Wrong path to settings" << std::endl;
             assert(0);
         }
 
@@ -54,7 +86,7 @@ StereoInertialNode::StereoInertialNode(ORB_SLAM3::System *SLAM, const string &st
         if (K_l.empty() || K_r.empty() || P_l.empty() || P_r.empty() || R_l.empty() || R_r.empty() || D_l.empty() || D_r.empty() ||
             rows_l == 0 || rows_r == 0 || cols_l == 0 || cols_r == 0)
         {
-            cerr << "ERROR: Calibration parameters to rectify stereo are missing!" << endl;
+            std::cerr << "ERROR: Calibration parameters to rectify stereo are missing!" << std::endl;
             assert(0);
         }
 
@@ -62,70 +94,304 @@ StereoInertialNode::StereoInertialNode(ORB_SLAM3::System *SLAM, const string &st
         cv::initUndistortRectifyMap(K_r, D_r, R_r, P_r.rowRange(0, 3).colRange(0, 3), cv::Size(cols_r, rows_r), CV_32F, M1r_, M2r_);
     }
 
-    double max_time_diff_ms = this->declare_parameter<double>("max_time_diff_ms", 10.0);
-    double gc_window_ms = this->declare_parameter<double>("gc_window_ms", 500.0);
-    double image_time_shift_ms = this->declare_parameter<double>("image_time_shift_ms", 0.0);
-    force_right_stamp_to_left_ = this->declare_parameter<bool>("force_right_stamp_to_left", false);
+    (void)this->declare_parameter<bool>("use_sensor_data_qos", false);
+    (void)this->declare_parameter<bool>("approximate_sync", false);
+    (void)this->declare_parameter<int>("sync_queue_size", 0);
+    (void)this->declare_parameter<bool>("visualization", true);
+    (void)this->declare_parameter<bool>("force_right_stamp_to_left", true);
 
-    max_diff_ns_ = static_cast<int64_t>(std::llround(max_time_diff_ms * 1e6));
-    gc_window_ns_ = static_cast<int64_t>(std::llround(std::max(0.0, gc_window_ms) * 1e6));
-    image_time_shift_ns_ = static_cast<int64_t>(std::llround(image_time_shift_ms * 1e6));
+    max_lr_diff_ms_ = std::max(0.1, this->declare_parameter<double>("max_lr_diff_ms", max_lr_diff_ms_));
+    imu_recent_epsilon_ms_ = std::max(0.1, this->declare_parameter<double>("imu_tail_epsilon_ms", imu_recent_epsilon_ms_));
+    min_imu_span_ms_ = std::max(0.0, this->declare_parameter<double>("min_imu_span_ms", min_imu_span_ms_));
+    imu_wait_timeout_ms_ = std::max(1.0, this->declare_parameter<double>("imu_wait_timeout_ms", imu_wait_timeout_ms_));
+    const int declared_img_queue = this->declare_parameter<int>("max_image_queue_size", static_cast<int>(max_image_queue_size_));
+    const int declared_imu_queue = this->declare_parameter<int>("max_imu_queue_size", static_cast<int>(max_imu_queue_size_));
+    const int max_img_queue = std::max(1, declared_img_queue);
+    const int max_imu_queue = std::max(1, declared_imu_queue);
+    max_image_queue_size_ = static_cast<std::size_t>(max_img_queue);
+    max_imu_queue_size_ = static_cast<std::size_t>(max_imu_queue);
 
-    subImu_ = this->create_subscription<ImuMsg>("imu", 1000, std::bind(&StereoInertialNode::GrabImu, this, _1));
-    subImgLeft_ = this->create_subscription<ImageMsg>("camera/left", 100, std::bind(&StereoInertialNode::GrabImageLeft, this, _1));
-    subImgRight_ = this->create_subscription<ImageMsg>("camera/right", 100, std::bind(&StereoInertialNode::GrabImageRight, this, _1));
+    subImu_ = this->create_subscription<ImuMsg>("imu", q_imu(), std::bind(&StereoInertialNode::on_imu, this, _1));
+    subImgLeft_ = this->create_subscription<ImageMsg>("camera/left", q_img(), std::bind(&StereoInertialNode::on_left, this, _1));
+    subImgRight_ = this->create_subscription<ImageMsg>("camera/right", q_img(), std::bind(&StereoInertialNode::on_right, this, _1));
 
     RCLCPP_INFO(this->get_logger(),
-                "pairing: max_time_diff_ms=%.3f, gc_window_ms=%.1f, image_time_shift_ms=%.3f, force_right_stamp_to_left=%s",
-                max_time_diff_ms,
-                gc_window_ms,
-                image_time_shift_ms,
-                force_right_stamp_to_left_ ? "true" : "false");
+                "pairing: lr_diff_ms<=%.2f imu_tail_eps_ms<=%.2f imu_span_ms>=%.2f imu_wait_ms=%.2f queues(img=%zu imu=%zu)",
+                max_lr_diff_ms_,
+                imu_recent_epsilon_ms_,
+                min_imu_span_ms_,
+                imu_wait_timeout_ms_,
+                max_image_queue_size_,
+                max_imu_queue_size_);
 }
 
 StereoInertialNode::~StereoInertialNode()
 {
-    // Stop all threads
     SLAM_->Shutdown();
-
-    // Save camera trajectory
     SLAM_->SaveKeyFrameTrajectoryTUM("KeyFrameTrajectory.txt");
 }
 
-void StereoInertialNode::GrabImu(const ImuMsg::SharedPtr msg)
+void StereoInertialNode::on_imu(const ImuMsg::SharedPtr msg)
 {
-    std::lock_guard<std::mutex> lock(bufMutex_);
-    imuBuf_.push(msg);
-    last_imu_ns_ = to_ns(msg->header.stamp);
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    imu_queue_.push_back(msg);
+    while (imu_queue_.size() > max_imu_queue_size_)
+    {
+        imu_queue_.pop_front();
+    }
+    imu_cv_.notify_all();
 }
 
-void StereoInertialNode::GrabImageLeft(const ImageMsg::SharedPtr msgLeft)
+void StereoInertialNode::on_left(const ImageMsg::SharedPtr msgLeft)
 {
-    const int64_t t_ns = to_ns(msgLeft->header.stamp);
-    {
-        std::lock_guard<std::mutex> lock(bufMutexLeft_);
-        left_q_[t_ns] = msgLeft;
-    }
-
-    try_match_from_left_(t_ns);
-    gc_old_();
+    push_and_try_(left_queue_, msgLeft);
 }
 
-void StereoInertialNode::GrabImageRight(const ImageMsg::SharedPtr msgRight)
+void StereoInertialNode::on_right(const ImageMsg::SharedPtr msgRight)
 {
-    const int64_t t_ns = to_ns(msgRight->header.stamp);
+    push_and_try_(right_queue_, msgRight);
+}
+
+void StereoInertialNode::push_and_try_(std::deque<ImageMsg::SharedPtr> &queue, const ImageMsg::SharedPtr &msg)
+{
     {
-        std::lock_guard<std::mutex> lock(bufMutexRight_);
-        right_q_[t_ns] = msgRight;
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        queue.push_back(msg);
+        while (queue.size() > max_image_queue_size_)
+        {
+            queue.pop_front();
+        }
+    }
+    try_match_and_feed_();
+}
+
+bool StereoInertialNode::find_nearest_locked_(const std::deque<ImageMsg::SharedPtr> &queue,
+                                              const rclcpp::Time &target,
+                                              ImageMsg::SharedPtr &matched) const
+{
+    if (queue.empty())
+    {
+        return false;
     }
 
-    try_match_from_right_(t_ns);
-    gc_old_();
+    double best_dt_ms = std::numeric_limits<double>::max();
+    ImageMsg::SharedPtr best;
+    for (const auto &msg : queue)
+    {
+        const double dt_ms = std::abs(duration_ms(rclcpp::Time(msg->header.stamp) - target));
+        if (dt_ms < best_dt_ms)
+        {
+            best_dt_ms = dt_ms;
+            best = msg;
+        }
+    }
+
+    if (best && best_dt_ms <= max_lr_diff_ms_)
+    {
+        matched = best;
+        return true;
+    }
+    return false;
+}
+
+bool StereoInertialNode::gather_imu_locked_(const rclcpp::Time &t_left,
+                                            const rclcpp::Time &t_prev,
+                                            std::vector<ImuMsg::SharedPtr> &collected,
+                                            bool &tail_within_margin,
+                                            double &imu_span_ms)
+{
+    collected.clear();
+    tail_within_margin = false;
+    imu_span_ms = 0.0;
+
+    while (!imu_queue_.empty() && rclcpp::Time(imu_queue_.front()->header.stamp) <= t_prev)
+    {
+        imu_queue_.pop_front();
+    }
+
+    for (const auto &imu : imu_queue_)
+    {
+        const rclcpp::Time t_imu(imu->header.stamp);
+        if (t_imu > t_left)
+        {
+            break;
+        }
+        collected.push_back(imu);
+    }
+
+    if (!collected.empty())
+    {
+        const rclcpp::Time first(collected.front()->header.stamp);
+        const rclcpp::Time last(collected.back()->header.stamp);
+        imu_span_ms = duration_ms(last - first);
+        tail_within_margin = duration_ms(t_left - last) <= imu_recent_epsilon_ms_;
+    }
+
+    while (!imu_queue_.empty() && rclcpp::Time(imu_queue_.front()->header.stamp) <= t_left)
+    {
+        imu_queue_.pop_front();
+    }
+
+    return !collected.empty();
+}
+
+void StereoInertialNode::try_match_and_feed_()
+{
+    ImageMsg::SharedPtr left;
+    ImageMsg::SharedPtr right;
+    rclcpp::Time t_left;
+    std::vector<ImuMsg::SharedPtr> imu_msgs;
+    bool tail_ok = false;
+    double imu_span_ms = 0.0;
+
+    std::unique_lock<std::mutex> lock(data_mutex_);
+    if (left_queue_.empty() || right_queue_.empty())
+    {
+        return;
+    }
+
+    left = left_queue_.back();
+    t_left = rclcpp::Time(left->header.stamp);
+
+    ImageMsg::SharedPtr right_candidate;
+    if (!find_nearest_locked_(right_queue_, t_left, right_candidate))
+    {
+        return;
+    }
+
+    left_queue_.clear();
+    auto it = std::find(right_queue_.begin(), right_queue_.end(), right_candidate);
+    if (it != right_queue_.end())
+    {
+        right_queue_.erase(it);
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(static_cast<int>(imu_wait_timeout_ms_));
+    double gap_ms = std::numeric_limits<double>::infinity();
+
+    while (rclcpp::ok())
+    {
+        ImuMsg::SharedPtr latest_before_left;
+        for (auto rit = imu_queue_.rbegin(); rit != imu_queue_.rend(); ++rit)
+        {
+            if (rclcpp::Time((*rit)->header.stamp) <= t_left)
+            {
+                latest_before_left = *rit;
+                break;
+            }
+        }
+
+        gap_ms = std::numeric_limits<double>::infinity();
+        if (latest_before_left)
+        {
+            gap_ms = duration_ms(t_left - rclcpp::Time(latest_before_left->header.stamp));
+            if (gap_ms <= imu_recent_epsilon_ms_)
+            {
+                break;
+            }
+        }
+
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "IMU tail gap=%.3f ms > eps=%.3f, waited %.1f ms => feeding anyway",
+                        gap_ms,
+                        imu_recent_epsilon_ms_,
+                        imu_wait_timeout_ms_);
+            break;
+        }
+
+        imu_cv_.wait_for(lock, std::chrono::milliseconds(1));
+        if (!rclcpp::ok())
+        {
+            return;
+        }
+    }
+
+    const bool have_prev_frame = last_frame_stamp_.nanoseconds() > 0;
+    rclcpp::Time t_prev = have_prev_frame ? last_frame_stamp_ : rclcpp::Time(t_left.nanoseconds() - static_cast<int64_t>(2e7), RCL_ROS_TIME);
+    if (t_prev > t_left)
+    {
+        t_prev = t_left;
+    }
+
+    gather_imu_locked_(t_left, t_prev, imu_msgs, tail_ok, imu_span_ms);
+
+    right = std::make_shared<ImageMsg>(*right_candidate);
+    right->header.stamp = left->header.stamp;
+
+    const bool span_ok = (imu_span_ms >= min_imu_span_ms_) || !have_prev_frame;
+
+    const auto left_copy = left;
+    const auto right_copy = right;
+    const auto imu_copy = imu_msgs;
+
+    lock.unlock();
+
+    std::vector<ORB_SLAM3::IMU::Point> imu_points;
+    imu_points.reserve(imu_copy.size());
+    for (const auto &imu : imu_copy)
+    {
+        const double t = Utility::StampToSec(imu->header.stamp);
+        cv::Point3f acc(imu->linear_acceleration.x, imu->linear_acceleration.y, imu->linear_acceleration.z);
+        cv::Point3f gyr(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z);
+        imu_points.emplace_back(acc, gyr, t);
+    }
+
+    if (!span_ok)
+    {
+        std::cout << "[WARN] IMU span " << std::fixed << std::setprecision(3) << imu_span_ms
+                  << " ms < required " << min_imu_span_ms_ << " ms -- feeding anyway" << std::endl;
+    }
+
+    publish_pair_(left_copy, right_copy, imu_points, tail_ok, imu_span_ms);
+
+    std::lock_guard<std::mutex> lock_update(data_mutex_);
+    last_frame_stamp_ = t_left;
+}
+
+void StereoInertialNode::publish_pair_(const ImageMsg::SharedPtr &left,
+                                       const ImageMsg::SharedPtr &right,
+                                       const std::vector<ORB_SLAM3::IMU::Point> &imu_points,
+                                       bool tail_within_margin,
+                                       double imu_span_ms)
+{
+    if (!left || !right)
+    {
+        return;
+    }
+
+    cv::Mat imLeft = GetImage(left);
+    cv::Mat imRight = GetImage(right);
+
+    if (bClahe_)
+    {
+        clahe_->apply(imLeft, imLeft);
+        clahe_->apply(imRight, imRight);
+    }
+
+    if (doRectify_)
+    {
+        cv::remap(imLeft, imLeft, M1l_, M2l_, cv::INTER_LINEAR);
+        cv::remap(imRight, imRight, M1r_, M2r_, cv::INTER_LINEAR);
+    }
+
+    const double tLeft = Utility::StampToSec(left->header.stamp);
+
+    std::cout << std::fixed << std::setprecision(6)
+              << "[PAIR] t=" << tLeft
+              << " imu_n=" << imu_points.size()
+              << " span_ms=" << std::setprecision(3) << imu_span_ms
+              << " tail<=eps=" << (tail_within_margin ? "YES" : "NO")
+              << " (L ts == R ts: " << (left->header.stamp == right->header.stamp ? "YES" : "NO") << ")"
+              << std::endl;
+
+    SLAM_->TrackStereo(imLeft, imRight, tLeft, imu_points);
 }
 
 cv::Mat StereoInertialNode::GetImage(const ImageMsg::SharedPtr msg)
 {
-    // Copy the ros image message to cv::Mat.
     cv_bridge::CvImageConstPtr cv_ptr;
 
     try
@@ -146,250 +412,6 @@ cv::Mat StereoInertialNode::GetImage(const ImageMsg::SharedPtr msg)
         std::cerr << "Error image type" << std::endl;
         return cv_ptr->image.clone();
     }
-}
-
-void StereoInertialNode::try_match_from_left_(int64_t tL)
-{
-    ImageMsg::ConstSharedPtr left;
-    ImageMsg::ConstSharedPtr right;
-    int64_t best_dt = std::numeric_limits<int64_t>::max();
-    bool matched = false;
-
-    {
-        std::unique_lock<std::mutex> left_lock(bufMutexLeft_, std::defer_lock);
-        std::unique_lock<std::mutex> right_lock(bufMutexRight_, std::defer_lock);
-        std::lock(left_lock, right_lock);
-        auto it_left = left_q_.find(tL);
-        if (it_left == left_q_.end() || right_q_.empty())
-        {
-            return;
-        }
-
-        auto candidate = right_q_.lower_bound(tL);
-        auto best_it = right_q_.end();
-
-        if (candidate != right_q_.end())
-        {
-            int64_t dt = std::llabs(candidate->first - tL);
-            best_dt = dt;
-            best_it = candidate;
-        }
-        if (candidate != right_q_.begin())
-        {
-            auto prev_it = std::prev(candidate);
-            int64_t dt = std::llabs(prev_it->first - tL);
-            if (dt < best_dt)
-            {
-                best_dt = dt;
-                best_it = prev_it;
-            }
-        }
-
-        if (best_it != right_q_.end() && best_dt <= max_diff_ns_)
-        {
-            left = it_left->second;
-            right = best_it->second;
-            left_q_.erase(it_left);
-            right_q_.erase(best_it);
-            matched = true;
-        }
-        else if (best_it != right_q_.end())
-        {
-            double dt_ms = static_cast<double>(best_dt) / 1e6;
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                                 "big time difference (L→R): %.3f ms", dt_ms);
-        }
-    }
-
-    if (matched)
-    {
-        publish_pair_(left, right, best_dt);
-    }
-}
-
-void StereoInertialNode::try_match_from_right_(int64_t tR)
-{
-    ImageMsg::ConstSharedPtr right;
-    ImageMsg::ConstSharedPtr left;
-    int64_t best_dt = std::numeric_limits<int64_t>::max();
-    bool matched = false;
-
-    {
-        std::unique_lock<std::mutex> left_lock(bufMutexLeft_, std::defer_lock);
-        std::unique_lock<std::mutex> right_lock(bufMutexRight_, std::defer_lock);
-        std::lock(left_lock, right_lock);
-        auto it_right = right_q_.find(tR);
-        if (it_right == right_q_.end() || left_q_.empty())
-        {
-            return;
-        }
-
-        auto candidate = left_q_.lower_bound(tR);
-        auto best_it = left_q_.end();
-
-        if (candidate != left_q_.end())
-        {
-            int64_t dt = std::llabs(candidate->first - tR);
-            best_dt = dt;
-            best_it = candidate;
-        }
-        if (candidate != left_q_.begin())
-        {
-            auto prev_it = std::prev(candidate);
-            int64_t dt = std::llabs(prev_it->first - tR);
-            if (dt < best_dt)
-            {
-                best_dt = dt;
-                best_it = prev_it;
-            }
-        }
-
-        if (best_it != left_q_.end() && best_dt <= max_diff_ns_)
-        {
-            right = it_right->second;
-            left = best_it->second;
-            right_q_.erase(it_right);
-            left_q_.erase(best_it);
-            matched = true;
-        }
-        else if (best_it != left_q_.end())
-        {
-            double dt_ms = static_cast<double>(best_dt) / 1e6;
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                                 "big time difference (R→L): %.3f ms", dt_ms);
-        }
-    }
-
-    if (matched)
-    {
-        publish_pair_(left, right, best_dt);
-    }
-}
-
-void StereoInertialNode::gc_old_()
-{
-    std::unique_lock<std::mutex> left_lock(bufMutexLeft_, std::defer_lock);
-    std::unique_lock<std::mutex> right_lock(bufMutexRight_, std::defer_lock);
-    std::lock(left_lock, right_lock);
-
-    int64_t now_ns = 0;
-    if (!left_q_.empty())
-    {
-        now_ns = std::max(now_ns, left_q_.rbegin()->first);
-    }
-    if (!right_q_.empty())
-    {
-        now_ns = std::max(now_ns, right_q_.rbegin()->first);
-    }
-
-    if (now_ns == 0 || gc_window_ns_ <= 0)
-    {
-        return;
-    }
-
-    const int64_t cutoff = now_ns - gc_window_ns_;
-    std::size_t dropped_left = 0;
-    std::size_t dropped_right = 0;
-
-    while (!left_q_.empty() && left_q_.begin()->first < cutoff)
-    {
-        left_q_.erase(left_q_.begin());
-        ++drop_left_gc_;
-        ++dropped_left;
-    }
-
-    while (!right_q_.empty() && right_q_.begin()->first < cutoff)
-    {
-        right_q_.erase(right_q_.begin());
-        ++drop_right_gc_;
-        ++dropped_right;
-    }
-
-    if (dropped_left || dropped_right)
-    {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                             "GC dropped frames: left=%zu right=%zu (window %.1f ms)",
-                             dropped_left,
-                             dropped_right,
-                             static_cast<double>(gc_window_ns_) / 1e6);
-    }
-}
-
-void StereoInertialNode::publish_pair_(ImageMsg::ConstSharedPtr left_in,
-                                       ImageMsg::ConstSharedPtr right_in,
-                                       int64_t dt_ns)
-{
-    if (!left_in || !right_in)
-    {
-        return;
-    }
-
-    auto left = std::make_shared<ImageMsg>(*left_in);
-    auto right = std::make_shared<ImageMsg>(*right_in);
-
-    if (force_right_stamp_to_left_)
-    {
-        right->header.stamp = left->header.stamp;
-    }
-
-    if (image_time_shift_ns_ != 0)
-    {
-        const int64_t shift = image_time_shift_ns_;
-        int64_t left_ns = to_ns(left->header.stamp) - shift;
-        int64_t right_ns = to_ns(right->header.stamp) - shift;
-        left->header.stamp = from_ns(std::max<int64_t>(0, left_ns));
-        right->header.stamp = from_ns(std::max<int64_t>(0, right_ns));
-    }
-
-    cv::Mat imLeft = GetImage(left);
-    cv::Mat imRight = GetImage(right);
-
-    if (bClahe_)
-    {
-        clahe_->apply(imLeft, imLeft);
-        clahe_->apply(imRight, imRight);
-    }
-
-    if (doRectify_)
-    {
-        cv::remap(imLeft, imLeft, M1l_, M2l_, cv::INTER_LINEAR);
-        cv::remap(imRight, imRight, M1r_, M2r_, cv::INTER_LINEAR);
-    }
-
-    const int64_t left_ns = to_ns(left->header.stamp);
-    const double tLeft = Utility::StampToSec(left->header.stamp);
-
-    std::vector<ORB_SLAM3::IMU::Point> vImuMeas;
-    {
-        std::lock_guard<std::mutex> lock(bufMutex_);
-        while (!imuBuf_.empty() && to_ns(imuBuf_.front()->header.stamp) <= left_ns)
-        {
-            const auto &imu_msg = imuBuf_.front();
-            double t = Utility::StampToSec(imu_msg->header.stamp);
-            cv::Point3f acc(imu_msg->linear_acceleration.x, imu_msg->linear_acceleration.y, imu_msg->linear_acceleration.z);
-            cv::Point3f gyr(imu_msg->angular_velocity.x, imu_msg->angular_velocity.y, imu_msg->angular_velocity.z);
-            vImuMeas.emplace_back(acc, gyr, t);
-            imuBuf_.pop();
-        }
-    }
-
-    SLAM_->TrackStereo(imLeft, imRight, tLeft, vImuMeas);
-
-    kept_++;
-    last_dt_ms_ = static_cast<double>(dt_ns) / 1e6;
-    double imu_lag_ms = 0.0;
-    if (last_imu_ns_ > 0)
-    {
-        imu_lag_ms = static_cast<double>(last_imu_ns_ - left_ns) / 1e6;
-    }
-
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                         "PAIR summary: kept=%lu dropL(GC)=%lu dropR(GC)=%lu last_dt_ms=%.3f imu_lag_ms=%.3f",
-                         kept_,
-                         drop_left_gc_,
-                         drop_right_gc_,
-                         last_dt_ms_,
-                         imu_lag_ms);
 }
 
 int64_t StereoInertialNode::to_ns(const builtin_interfaces::msg::Time &t)

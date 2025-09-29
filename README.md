@@ -75,6 +75,21 @@ $ ros2 run orbslam3 rgbd PATH_TO_VOCABULARY PATH_TO_YAML_CONFIG_FILE
 $ ros2 run orbslam3 stereo-inertial PATH_TO_VOCABULARY PATH_TO_YAML_CONFIG_FILE BOOL_RECTIFY [BOOL_EQUALIZE]
 ```
 
+### Stereo-inertial pairing parameters
+
+The stereo-inertial node exposes several ROS parameters to help tune timestamp pairing and IMU ingestion:
+
+- `exact_sync` (bool, default `true`): require identical timestamps for left/right frames before pairing; disable to allow tolerance-based matching using `stamp_epsilon_ms`.
+- `stamp_epsilon_ms` (double, default `max_time_diff_ms`): maximum time delta between left/right frames when `exact_sync` is `false`.
+- `gc_window_ms` (double, default `500.0`): age window for discarding unmatched frames from the pairing queues.
+- `image_time_shift_ms` (double, default `0.0`): constant offset applied to image timestamps prior to publishing to ORB-SLAM3.
+- `force_right_stamp_to_left` (bool, default `true`): align the right image timestamp with its paired left frame.
+- `imu_warmup_count` (int, default `10`): minimum IMU samples that must be accumulated before stereo pairs are forwarded to ORB-SLAM3.
+- `min_imu_span_ms` (double, default `10.0`): minimum time span covered by the IMU batch accompanying a stereo pair.
+- `use_sensor_data_qos` (bool, default `true`): subscribe with `SensorDataQoS` to avoid losing high-frequency IMU samples due to QoS mismatches.
+- `imu_pad_enable` (bool, default `true`): append a synthetic IMU sample at the frame timestamp when the latest real measurement is within `imu_tail_margin_ms`.
+- `imu_tail_margin_ms` (double, default `2.0`): maximum allowed IMU lag (in milliseconds) before padding or dropping the stereo pair.
+
 ## Run with rosbag
 To play ros1 bag file, you should install `ros1 noetic` & `ros1 bridge`.  
 Here is a [link](https://www.theconstructsim.com/ros2-qa-217-how-to-mix-ros1-and-ros2-packages/) to demonstrate example of `ros1-ros2 bridge` procedure.  
